@@ -405,15 +405,21 @@ void *log_thread(void *arg)
 
         nanosleep(&delay, NULL);
     }
-
-    pthread_join(t1, NULL);
-    pthread_join(t2, NULL);
-    running_spinner = 0;
-    pthread_join(spinner_thread, NULL);
-    pthread_join(writer_thread, NULL);
-    fclose(logfile);
-
+    
     print_to_lcd("Saving to", filename);
+
+	running = 0;
+	pthread_cond_signal(&log_buffer.cond);
+	
+	pthread_join(t1, NULL);
+	pthread_join(t2, NULL);
+	running_spinner = 0;
+	pthread_join(spinner_thread, NULL);
+	pthread_join(writer_thread, NULL);
+	fclose(logfile);
+
+
+    
     return NULL;
 }
 

@@ -26,6 +26,11 @@
 #define GPPUA    0x0C
 #define I2C_DEV "/dev/i2c-1"
 #define LIVE_AVG_SAMPLES 300
+#define SPEED 2000
+
+#define LOG_BUFFER_SIZE 5000  // ~10 seconds at 500Hz
+
+
 
 int topout_front = 0;
 int topout_rear = 0;
@@ -39,10 +44,10 @@ int selected = 0;
 int running = 0;
 int running_spinner = 0;
 
-int sensor1_dist = -1;
-int sensor2_dist = -1;
-int sensor1_strength = -1;
-int sensor2_strength = -1;
+volatile int sensor1_dist = -1;
+volatile int sensor2_dist = -1;
+volatile int sensor1_strength = -1;
+volatile int sensor2_strength = -1;
 
 int fd;
 static char last_line1[LCD_LINE_LEN + 1] = {0};
@@ -59,6 +64,21 @@ char *menu_items[] = {
 enum Button { NONE, UP, DOWN, LEFT, RIGHT, SELECT };
 
 enum Button button_value = NONE;
+
+typedef struct {
+    char lines[LOG_BUFFER_SIZE][64];
+    int head;
+    int tail;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+} log_buffer_t;
+
+log_buffer_t log_buffer = {
+    .head = 0,
+    .tail = 0,
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER
+};
 
 void mcp_write(uint8_t reg, uint8_t val)
 {
@@ -121,35 +141,6 @@ void truncate_and_escape(const char *input, char *output, size_t max_len)
     output[out_i] = '\0';
 }
 
-//working
-/*void print_to_lcd(const char *line1, const char *line2)
-{
-    static struct timespec last = {0};
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    double elapsed = (now.tv_sec - last.tv_sec)
-                   + (now.tv_nsec - last.tv_nsec) / 1e9;
-
-    if(elapsed < 1) // skip if less than 1s since last
-        return;
-
-    last = now;
-
-    char line1_trim[LCD_LINE_LEN + 1] = {0};
-    char line2_trim[LCD_LINE_LEN + 1] = {0};
-
-    strncpy(line1_trim, line1 ? line1 : "", LCD_LINE_LEN);
-    strncpy(line2_trim, line2 ? line2 : "", LCD_LINE_LEN);
-
-    FILE *lcd = popen("./lcd_send.py", "w");
-    if(lcd)
-    {
-        fprintf(lcd, "%s\n%s\n", line1_trim, line2_trim);
-        pclose(lcd);
-    }
-}*/
-
 void print_to_lcd(const char *line1, const char *line2)
 {
     static struct timespec last = {0};
@@ -208,7 +199,7 @@ void *lcd_spinner_thread(void *arg)
         fflush(stdout);
 
         frame++;
-        usleep(500000); 
+        usleep(750000); 
     }
 
     return NULL;
@@ -314,7 +305,7 @@ void *read_sensor(void *arg)
         }
         else
         {
-            usleep(1000);
+            usleep(SPEED);
         }
     }
 
@@ -323,76 +314,41 @@ void *read_sensor(void *arg)
 }
 
 
-/*//worked
-void *read_sensor(void *arg)
+void *log_writer_thread(void *arg)
 {
-    char *dev = (char *)arg;
-    int fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if(fd < 0)
+    FILE *logfile = (FILE *)arg;
+
+    // Buffered output
+    char *logbuf = malloc(65536);
+    if(logbuf)
+        setvbuf(logfile, logbuf, _IOFBF, 65536);
+
+    while(running || log_buffer.head != log_buffer.tail)
     {
-        perror("open sensor");
-        return NULL;
+        pthread_mutex_lock(&log_buffer.lock);
+        while(log_buffer.head == log_buffer.tail && running)
+            pthread_cond_wait(&log_buffer.cond, &log_buffer.lock);
+
+        while(log_buffer.head != log_buffer.tail)
+        {
+            fputs(log_buffer.lines[log_buffer.tail], logfile);
+            log_buffer.tail = (log_buffer.tail + 1) % LOG_BUFFER_SIZE;
+        }
+
+        pthread_mutex_unlock(&log_buffer.lock);
+        fflush(logfile);
     }
 
-    tcflush(fd, TCIFLUSH); // clear junk
-
-    unsigned char buf[9];
-    int state = 0;
-
-	while(running)
-    {
-        unsigned char byte;
-        int n = read(fd, &byte, 1);
-        if(n == 1)
-        {
-            // Frame sync: look for 0x59 0x59
-            switch(state)
-            {
-                case 0:
-                    if(byte == 0x59)
-                        state = 1;
-                    break;
-                case 1:
-                    if(byte == 0x59)
-                    {
-                        buf[0] = 0x59;
-                        buf[1] = 0x59;
-                        state = 2;
-                    }
-                    else
-                        state = 0;
-                    break;
-                default:
-                    buf[state++] = byte;
-                    if(state == 9)
-                    {
-                        int dist = buf[2] + (buf[3] << 8);
-                        if(dist > 0 && dist < 1200)
-                        {
-                            if(strcmp(dev, SENSOR_1) == 0)
-                                sensor1_dist = dist;
-                            else
-                                sensor2_dist = dist;
-                        }
-                        state = 0;
-                    }
-                    break;
-            }
-        }
-        else
-        {
-            usleep(1000); // avoid CPU spin
-        }
-    }
-
-    close(fd);
+    // Final flush
+    fflush(logfile);
+    if(logbuf)
+        free(logbuf);
     return NULL;
-}*/
-
+}
 
 void *log_thread(void *arg)
 {
-    pthread_t t1, t2, spinner_thread;
+    pthread_t t1, t2, writer_thread, spinner_thread;
     running = 1;
 
     time_t now = time(NULL);
@@ -406,64 +362,58 @@ void *log_thread(void *arg)
         print_to_lcd("Failed to", "open log");
         perror("Failed to open log file");
         running = 0;
-        running_spinner = 0;
-        pthread_join(spinner_thread, NULL);
         return NULL;
     }
 
-    fprintf(logfile, "time_s,sensor1_cm,sensor2_cm\n");
+    fputs("time_s,sensor1_cm,sensor2_cm\n", logfile);
 
     pthread_create(&t1, NULL, read_sensor, (void *)SENSOR_1);
     pthread_create(&t2, NULL, read_sensor, (void *)SENSOR_2);
 
     while(sensor1_dist == -1 || sensor2_dist == -1)
-    {
-        usleep(1000);
-    }
-
-    struct timespec start_time, now_time, last_flush;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-    last_flush = start_time;
+        usleep(SPEED);
 
     print_to_lcd("Logging to", filename);
-    sleep(5);
-    
-    // Spinner setup
+    sleep(2);
+
     static spinner_args_t spinner_data = {.prefix = "Logging..."};
     running_spinner = 1;
     pthread_create(&spinner_thread, NULL, lcd_spinner_thread, &spinner_data);
-    
+    pthread_create(&writer_thread, NULL, log_writer_thread, logfile);
+
+    struct timespec start, now_time, delay = {0, SPEED * 1000};
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
     while(running)
     {
         clock_gettime(CLOCK_MONOTONIC, &now_time);
-        double elapsed = (now_time.tv_sec - start_time.tv_sec)
-                       + (now_time.tv_nsec - start_time.tv_nsec) / 1e9;
+        double elapsed = (now_time.tv_sec - start.tv_sec)
+                       + (now_time.tv_nsec - start.tv_nsec) / 1e9;
 
-        fprintf(logfile, "%.6f,%d,%d\n", elapsed, sensor1_dist, sensor2_dist);
+        char line[64];
+        snprintf(line, sizeof(line), "%.6f,%d,%d\n", elapsed, sensor1_dist, sensor2_dist);
 
-        double flush_elapsed = (now_time.tv_sec - last_flush.tv_sec)
-                             + (now_time.tv_nsec - last_flush.tv_nsec) / 1e9;
-        if(flush_elapsed >= 10.0)
+        pthread_mutex_lock(&log_buffer.lock);
+        int next_head = (log_buffer.head + 1) % LOG_BUFFER_SIZE;
+        if(next_head != log_buffer.tail)
         {
-            fflush(logfile);
-            last_flush = now_time;
+            strcpy(log_buffer.lines[log_buffer.head], line);
+            log_buffer.head = next_head;
+            pthread_cond_signal(&log_buffer.cond);
         }
+        pthread_mutex_unlock(&log_buffer.lock);
 
-        usleep(1000); // ~1 kHz
+        nanosleep(&delay, NULL);
     }
-    
-    print_to_lcd("Saving to", filename);
-
 
     pthread_join(t1, NULL);
     pthread_join(t2, NULL);
     running_spinner = 0;
     pthread_join(spinner_thread, NULL);
-
-    fflush(logfile);
+    pthread_join(writer_thread, NULL);
     fclose(logfile);
-    printf("\n");
 
+    print_to_lcd("Saving to", filename);
     return NULL;
 }
 
